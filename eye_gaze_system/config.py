@@ -67,7 +67,7 @@ def get_default_config() -> Dict[str, Any]:
         # Cursor control
         "enable_interpolation": False,   # interpolation adds blocking sleep() calls per frame
         "interpolation_steps": 1,
-        "cursor_min_move_px": 3,         # px threshold; keeps tremor from wiggling cursor
+        "cursor_min_move_px": 5,         # px threshold; keeps tremor from wiggling cursor
 
         # Camera
         "camera_flip_horizontal": True,
@@ -86,12 +86,12 @@ def get_default_config() -> Dict[str, Any]:
         # Run diagnose_gaze.py to remeasure if gains feel wrong.
         "iris_invert_x": True,           # looking right → iris_x DECREASES on flipped camera
         "relative_iris_gain": 39.5,
-        "relative_iris_gain_x": 39.5,    # raise if can't reach left/right edges
-        "relative_iris_gain_y": 72.8,    # raise if can't reach top/bottom edges
+        "relative_iris_gain_x": 45.0,    # Increased from 39.5
+        "relative_iris_gain_y": 85.0,   # raise if can't reach top/bottom edges
         "gaze_smoothing_alpha": 0.6,
-        "smooth_fast_thresh_px": 80,     # px distance above which move is intentional (no smoothing)
-        "smooth_slow_alpha": 0.35,       # smoothing weight when holding still (tremor damping)
-        "gaze_dead_zone": 0.001,         # iris noise floor; lower = more sensitive
+        "smooth_fast_thresh_px": 60,     # Lowered: faster response to intentional moves
+        "smooth_slow_alpha": 0.15,      # smoothing weight when holding still (tremor damping)
+        "gaze_dead_zone": 0.0015,         # iris noise floor; lower = more sensitive
 
         # Debug: bypass filters/calibration and map iris pixel -> screen directly (with prints)
         "debug_direct_cursor": False,

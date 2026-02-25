@@ -204,6 +204,12 @@ class EyeGazeSystem:
         # Relative iris position in eye socket (0-1): responds to eyeball movement, not head
         relative_iris = self.face_detector.get_left_eye_relative_iris_position(landmarks)
         used_fallback = False
+        if self._last_relative_iris is not None:
+            lx, ly = self._last_relative_iris
+            if abs(iris_x - lx) < self.config.get("gaze_dead_zone", 0.001) and \
+                abs(iris_y - ly) < self.config.get("gaze_dead_zone", 0.001):
+                iris_x, iris_y = lx, ly
+            self._last_relative_iris = (iris_x, iris_y)
         if relative_iris is None:
             # Fallback: absolute iris -> screen so cursor still moves
             iris_center_2d = self.face_detector.get_iris_center_2d(
@@ -262,10 +268,8 @@ class EyeGazeSystem:
         if self._last_smoothed_screen is not None:
             sx, sy = self._last_smoothed_screen
             dist = ((screen_x_direct - sx) ** 2 + (screen_y_direct - sy) ** 2) ** 0.5
-            # Fast threshold: moves > 80px are clearly intentional
-            fast_thresh = float(self.config.get("smooth_fast_thresh_px", 80))
-            slow_alpha  = float(self.config.get("smooth_slow_alpha", 0.35))
-            # Blend from slow_alpha (at dist=0) to 1.0 (at dist=fast_thresh)
+            fast_thresh = float(self.config.get("smooth_fast_thresh_px", 60))
+            slow_alpha = float(self.config.get("smooth_slow_alpha", 0.15))
             alpha = min(1.0, slow_alpha + (1.0 - slow_alpha) * (dist / fast_thresh))
             screen_x_direct = alpha * screen_x_direct + (1.0 - alpha) * sx
             screen_y_direct = alpha * screen_y_direct + (1.0 - alpha) * sy

@@ -206,8 +206,8 @@ class EyeGazeSystem:
         used_fallback = False
         if self._last_relative_iris is not None:
             lx, ly = self._last_relative_iris
-            if abs(iris_x - lx) < self.config.get("gaze_dead_zone", 0.001) and \
-                abs(iris_y - ly) < self.config.get("gaze_dead_zone", 0.001):
+            if abs(iris_x - lx) < self.config.get("gaze_dead_zone", 0.0015) and \
+                abs(iris_y - ly) < self.config.get("gaze_dead_zone", 0.0015):
                 iris_x, iris_y = lx, ly
             self._last_relative_iris = (iris_x, iris_y)
         if relative_iris is None:
@@ -268,8 +268,8 @@ class EyeGazeSystem:
         if self._last_smoothed_screen is not None:
             sx, sy = self._last_smoothed_screen
             dist = ((screen_x_direct - sx) ** 2 + (screen_y_direct - sy) ** 2) ** 0.5
-            fast_thresh = float(self.config.get("smooth_fast_thresh_px", 60))
-            slow_alpha = float(self.config.get("smooth_slow_alpha", 0.15))
+            fast_thresh = float(self.config.get("smooth_fast_thresh_px", 50))
+            slow_alpha = float(self.config.get("smooth_slow_alpha", 0.12))
             alpha = min(1.0, slow_alpha + (1.0 - slow_alpha) * (dist / fast_thresh))
             screen_x_direct = alpha * screen_x_direct + (1.0 - alpha) * sx
             screen_y_direct = alpha * screen_y_direct + (1.0 - alpha) * sy

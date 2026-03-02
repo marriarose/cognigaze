@@ -1,0 +1,125 @@
+# Gaze Tracking System Refinement
+
+## 1. Why Current Edge Compression Occurs
+Edge compression (the cursor failing to reach the limits of the screen and losing stability) happens due to several physiological and projective geometric factors:
+- **Spherical Projection:** The eyeball is a sphere. When the pupil moves towards extreme left/right/up/down positions, the 2D projection on the camera sensor moves non-linearly. A 10-degree rotation near the center causes a large 2D displacement, while a 10-degree rotation near the edge of the eye causes very little 2D displacement.
+- **Natural Head Movement limitations:** Users naturally incorporate subtle head movements to look at screen edges. If the system solely relies on the iris position *relative to the eye corners* without accommodating head pose, the effective iris movement is severely limited.
+- **Algorithmic Min-Max Cropping:** Linear scaling mappings rely on absolute maximums and minimums recorded during calibration. However, reaching the exact same physiological extreme repeatedly is difficult, causing a persistent "dead band" at the edges of the screen mappings.
+
+## 2. Mathematical Model for Improved Mapping
+To correct screen edge mapping and compensate for edge dead zones, we introduce **Virtual Padding** and **Non-linear Scaling (Cubic Edge Amplification)**.
+
+### Virtual Padding (Edge Compensation)
+Instead of mapping the iris's bounding box directly to `[0, 1]`, we map a slightly smaller "inner box" to `[0, 1]`. Any gaze falling in the outer padding area gets clamped to the screen edges.
+$$ g_{padded} = \max\left(0, \min\left(1, \frac{g_{raw} - P}{1 - 2P}\right)\right) $$
+Where $g_{raw} \in [0, 1]$ is the linearly normalized gaze, and $P$ is the padding percentage (e.g., $P = 0.1$ means 10% padding on each side).
+
+### Cubic Edge Amplification
+To amplify edge responsiveness safely, apply a cubic polynomial curve centered at $0.5$. It provides an acceleration curve toward the edges while remaining smooth at the center. 
+$$ f(t) = a(t - 0.5)^3 + (1 - 0.25a)(t - 0.5) + 0.5 $$
+Where $t \in [0, 1]$ is the padded gaze coordinate, and $a$ is the amplification factor (e.g., $a \in [1.5, 3.0]$).
+
+## 3. Recommended Pipeline Architecture
+A robust system requires separating signal extraction, filtering, mapping, and interaction logic.
+
+1. **Input & Vision Layer:** OpenCV Frame $\rightarrow$ MediaPipe Face Mesh $\rightarrow$ Extract Iris & Eye Corner Landmarks.
+2. **Feature Extraction Layer:** Calculate relative Normalized Iris Position (NIP). Extract Head Pose (pitch, yaw, roll) to compensate for head drift.
+3. **Calibration Layer:** N-point grid. Collect $N=50$ samples per point, drop outliers (Interquartile Range method), and compute the bounding box of effective gaze.
+4. **Signal Processing Layer:**
+   - *Micro-jitter Dead-zone Layer:* Discards delta movements below a threshold.
+   - *Kalman Filter:* Predicts trajectory and suppresses sensor measurement noise.
+   - *Dynamic EMA (Exponential Moving Average):* Heavy smoothing when velocity is low (precision needed), light smoothing when velocity is high (fast traversal).
+5. **Mapping Layer:** Apply Virtual Padding $\rightarrow$ Apply Cubic Edge Amplification $\rightarrow$ Map to Screen Resolution.
+6. **Interaction & OS Layer:** 
+   - *Dwell Clicker:* Circular progress bar visual feedback.
+   - *Snap-to-Target:* Magnetically snap to UI coordinates if the cursor velocity approaches zero near a known element.
+
+## 4. Pseudocode
+
+```python
+import numpy as np
+import math
+
+class GazeProcessor:
+    def __init__(self):
+        # Recommended Parameters
+        self.padding = 0.12            # 12% artificial padding
+        self.amp_factor = 2.0          # Cubic amplification
+        self.dead_zone = 0.003         # Normalized spatial threshold
+        self.alpha_min = 0.1           # High smoothing for precision
+        self.alpha_max = 0.6           # Low smoothing for speed
+        self.vel_max = 0.05            # Velocity saturation limit
+        
+        self.prev_raw = None
+        self.prev_smooth = None
+        self.kalman = KalmanFilter2D() # Standard Linear Kalman Filter
+        
+    def map_and_smooth(self, raw_x, raw_y):
+        """
+        raw_x, raw_y: Linearly mapped gaze [0, 1] based on calibration min/max.
+        """
+        
+        # 1. Edge Compensation (Padding)
+        px = clamp((raw_x - self.padding) / (1.0 - 2 * self.padding), 0.0, 1.0)
+        py = clamp((raw_y - self.padding) / (1.0 - 2 * self.padding), 0.0, 1.0)
+        
+        # 2. Cubic Edge Mapping
+        mx = self._cubic_amplify(px, self.amp_factor)
+        my = self._cubic_amplify(py, self.amp_factor)
+        
+        # Initialize
+        if self.prev_raw is None:
+            self.prev_raw = (mx, my)
+            self.prev_smooth = (mx, my)
+            return mx, my
+            
+        # 3. Dead-zone calculation
+        dx = mx - self.prev_raw[0]
+        dy = my - self.prev_raw[1]
+        dist = math.hypot(dx, dy)
+        
+        if dist < self.dead_zone:
+            # Suppress micro-movement jitter (Precision targeting)
+            mx, my = self.prev_raw 
+            dist = 0.0
+            
+        # 4. Kalman Filtering
+        kx, ky = self.kalman.predict_and_update(mx, my)
+        
+        # 5. Dynamic EMA (Exponential Moving Average)
+        # Higher velocity -> Higher Alpha -> Less Smoothing -> Faster Response
+        vel_ratio = clamp(dist / self.vel_max, 0.0, 1.0)
+        alpha = self.alpha_min + vel_ratio * (self.alpha_max - self.alpha_min)
+        
+        smooth_x = alpha * kx + (1 - alpha) * self.prev_smooth[0]
+        smooth_y = alpha * ky + (1 - alpha) * self.prev_smooth[1]
+        
+        self.prev_raw = (mx, my)
+        self.prev_smooth = (smooth_x, smooth_y)
+        
+        return smooth_x, smooth_y
+        
+    def _cubic_amplify(self, t, a):
+        tc = t - 0.5
+        val = a * (tc ** 3) + (1 - 0.25 * a) * tc + 0.5
+        return clamp(val, 0.0, 1.0)
+
+def clamp(val, min_val, max_val):
+    return max(min_val, min(max_val, val))
+```
+
+## 5. Recommended Parameter Values
+
+| Parameter | Recommended Initial Value | Purpose |
+| :--- | :--- | :--- |
+| `padding` ($P$) | `0.10` to `0.15` | Ensures corners are accessible without straining eye muscles. Cuts off top/bottom 10-15% of calibrated range. |
+| `amp_factor` ($a$) | `1.5` to `2.5` | Degree of non-linearity. `< 1` flattens edges, `> 1` amplifies them. Maximum safe value is `4.0`. |
+| `dead_zone` | `0.002` to `0.005` | Threshold mapping magnitude. Stops cursor float when starring at a single element. |
+| `alpha_min` | `0.05` to `0.15` | Base EMA alpha. Provides heavy smoothing for small targets/reading text. |
+| `alpha_max` | `0.6` to `0.85` | High-bound EMA alpha. Prevents "dragging" sensation when throwing gaze across the screen. |
+| **Dwell Time** | `800ms` to `1200ms` | Time needed to hold cursor within a 20x20 pixel radius to trigger a click. |
+
+## 6. Snap-to-Target & Micro-Adjustment Logic
+For **Precision Targeting**:
+- **Snap-to-Target**: Expose an API defining clickable UI bounding boxes. If the velocity drops below $0.01$ units/frame and the cursor is within $50$ pixels of an element's center, interpolate the cursor position directly to the element's coordinate space over 5 frames.
+- **Micro-adjustment Mode**: Track eye blinks (MediaPipe `eye_blink` blendshape). A quick intentional blink toggles a "Precision Mode" where `alpha_max` drops to `0.2` and the `amp_factor` shifts to `1.0` (linear), providing slow, deliberate, low-sensitivity crawling.

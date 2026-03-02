@@ -22,6 +22,7 @@ try:
     from .cursor_control import CursorController
     from .gaze_calibration import GazeCalibration, CalibrationSession
     from .utils import map_to_screen, clamp_screen_coordinates
+    from .filters.gaze_processor import GazeProcessor
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from eye_gaze_system.config import Config, get_default_config, merge_config
@@ -39,6 +40,7 @@ except ImportError:
     from eye_gaze_system.cursor_control import CursorController
     from eye_gaze_system.gaze_calibration import GazeCalibration, CalibrationSession
     from eye_gaze_system.utils import map_to_screen, clamp_screen_coordinates
+    from eye_gaze_system.filters.gaze_processor import GazeProcessor
 
 
 class EyeGazeSystem:
@@ -136,7 +138,9 @@ class EyeGazeSystem:
         self._debug_frame_count = 0
         self._process_frame_count = 0
         self._last_relative_iris: Optional[Tuple[float, float]] = None
-        self._last_smoothed_screen: Optional[Tuple[float, float]] = None
+        
+        # New Advanced Edge Mapping, Padding, and Filtering Model
+        self.advanced_processor = GazeProcessor()
 
     def _init_smoothing_filter(self, cfg: Dict[str, Any]):
         ft = self.filter_type
@@ -233,7 +237,8 @@ class EyeGazeSystem:
                     self.gaze_calib = self._calib_session.calib
                     self._gaze_centre = (self.gaze_calib.cx, self.gaze_calib.cy)
                     self._calib_session = None
-                    self._last_smoothed_screen = None
+                    self.advanced_processor.prev_raw = None
+                    self.advanced_processor.prev_smooth = None
                 return None, landmarks
 
             # ── If 9-point calibration exists, use it directly ─────────────
@@ -257,25 +262,17 @@ class EyeGazeSystem:
                 else:
                     screen_x_direct, screen_y_direct = self.gaze_calib.map(iris_x, iris_y)
 
-        screen_x_direct, screen_y_direct = clamp_screen_coordinates(
-            screen_x_direct, screen_y_direct, self.screen_w, self.screen_h
-        )
+        # ── Apply Advanced Edge Compensation & Smoothing ─────────────
+        # Normalize into [0, 1] range for GazeProcessor
+        norm_x = screen_x_direct / self.screen_w
+        norm_y = screen_y_direct / self.screen_h
+        
+        sm_norm_x, sm_norm_y = self.advanced_processor.map_and_smooth(norm_x, norm_y)
+        
+        # Denormalize back to screen pixels
+        screen_x_direct = int(round(sm_norm_x * self.screen_w))
+        screen_y_direct = int(round(sm_norm_y * self.screen_h))
 
-        # Velocity-adaptive smoothing:
-        # - Large moves (intentional gaze shift) → pass through instantly (alpha≈1.0)
-        # - Small moves (tremor) → heavy smoothing (alpha≈0.3)
-        # This eliminates lag on fast moves while still damping jitter when holding still.
-        if self._last_smoothed_screen is not None:
-            sx, sy = self._last_smoothed_screen
-            dist = ((screen_x_direct - sx) ** 2 + (screen_y_direct - sy) ** 2) ** 0.5
-            fast_thresh = float(self.config.get("smooth_fast_thresh_px", 50))
-            slow_alpha = float(self.config.get("smooth_slow_alpha", 0.12))
-            alpha = min(1.0, slow_alpha + (1.0 - slow_alpha) * (dist / fast_thresh))
-            screen_x_direct = alpha * screen_x_direct + (1.0 - alpha) * sx
-            screen_y_direct = alpha * screen_y_direct + (1.0 - alpha) * sy
-        self._last_smoothed_screen = (float(screen_x_direct), float(screen_y_direct))
-        screen_x_direct = int(round(screen_x_direct))
-        screen_y_direct = int(round(screen_y_direct))
         screen_x_direct, screen_y_direct = clamp_screen_coordinates(
             screen_x_direct, screen_y_direct, self.screen_w, self.screen_h
         )
@@ -422,7 +419,7 @@ class EyeGazeSystem:
 
             pyautogui.FAILSAFE = False
             pyautogui.PAUSE = 0.0   # default is 0.1s — 100ms lag per moveTo call
-            calib_status = "9-pt calibration loaded ✓" if self.gaze_calib.calibrated else "No calibration — press C to calibrate"
+            calib_status = "9-pt calibration loaded [OK]" if self.gaze_calib.calibrated else "No calibration — press C to calibrate"
             print(f"Eye Gaze System started. Press q=quit, d=debug, c=calibrate, r=reset centre.")
             print(f"Screen: {self.screen_w}x{self.screen_h}  |  {calib_status}")
 
@@ -474,14 +471,16 @@ class EyeGazeSystem:
                     self._calib_session = CalibrationSession(
                         self.gaze_calib, self.screen_w, self.screen_h
                     )
-                    self._last_smoothed_screen = None
+                    self.advanced_processor.prev_raw = None
+                    self.advanced_processor.prev_smooth = None
                 elif key == ord(" ") and self._calib_session is not None:
                     self._calib_session.confirm_point()
                 elif key == ord("r"):
                     # Reset gaze centre — look straight at screen and press r
                     self._gaze_centre = None
                     self._gaze_centre_samples = []
-                    self._last_smoothed_screen = None
+                    self.advanced_processor.prev_raw = None
+                    self.advanced_processor.prev_smooth = None
                     self._last_relative_iris = None
                     print("[CogniGaze] Gaze centre RESET — hold still for 2 seconds to recalibrate.")
 

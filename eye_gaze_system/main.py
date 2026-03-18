@@ -13,6 +13,7 @@ try:
     from .iris_tracker import IrisTracker
     from .gaze_estimator import GazeEstimator
     from .blink_detector import BlinkDetector
+    from .dwell_detector import DwellDetector
     from .calibration import Calibration
     from .filters.kalman_filter import KalmanFilter
     from .filters.gaussian_outlier_filter import GaussianOutlierFilter
@@ -31,6 +32,7 @@ except ImportError:
     from eye_gaze_system.iris_tracker import IrisTracker
     from eye_gaze_system.gaze_estimator import GazeEstimator
     from eye_gaze_system.blink_detector import BlinkDetector
+    from eye_gaze_system.dwell_detector import DwellDetector
     from eye_gaze_system.calibration import Calibration
     from eye_gaze_system.filters.kalman_filter import KalmanFilter
     from eye_gaze_system.filters.gaussian_outlier_filter import GaussianOutlierFilter
@@ -77,6 +79,7 @@ class EyeGazeSystem:
             long_blink_frames=cfg["long_blink_frames"],
             debounce_time=cfg["debounce_time"],
         )
+        self.dwell_detector = DwellDetector(dwell_time=1.5, radius_px=25)
         self.calibration = Calibration(calibration_file=cfg["calibration_file"])
 
         if cfg["use_calibration"]:
@@ -115,20 +118,10 @@ class EyeGazeSystem:
             min_move_px=cfg.get("cursor_min_move_px", 8),
         )
 
-        # 9-point gaze calibration — accurate nonlinear iris→screen mapping
-        self.gaze_calib = GazeCalibration(
-            screen_w=self.screen_w,
-            screen_h=self.screen_h,
-            invert_x=cfg.get("iris_invert_x", True),
-            gain_x=float(cfg.get("relative_iris_gain_x", 39.5)),
-            gain_y=float(cfg.get("relative_iris_gain_y", 72.8)),
-        )
-        self._calib_session: Optional[CalibrationSession] = None
-
-        # Warmup centre (resting iris position, used when no 9-point calib exists)
-        self._gaze_centre: Optional[Tuple[float, float]] = None
-        self._gaze_centre_samples: list = []
-        self._GAZE_CENTRE_WARMUP = 60
+        # Fully Dynamic Range Tracking for Absolute/Relative bounds
+        self.eye_min_x, self.eye_max_x = 0.5, 0.5
+        self.eye_min_y, self.eye_max_y = 0.5, 0.5
+        self._bounds_initialized = False
 
         # State
         self.last_cursor_position: Optional[Tuple[int, int]] = None
@@ -205,73 +198,65 @@ class EyeGazeSystem:
         if landmarks is None:
             return None, None
 
-        # Relative iris position in eye socket (0-1): responds to eyeball movement, not head
+        # Blink Freeze: prevent unstable movement during blinks
+        ear = self.blink_detector.get_ear_value(landmarks, "left")
+        # EAR drops below ~0.28 right before/during blink
+        if ear is not None and ear < 0.28 and self.last_cursor_position:
+            # The cursor position freezes but the frame and landmarks are still returned
+            # allowing the BlinkDetector to trigger the actual click.
+            if draw_visualization:
+                self._draw_visualization(frame, landmarks, frame_w, frame_h)
+                self._draw_tracking_state(frame, frame_w, frame_h, self.current_fps)
+                if self.debug_mode:
+                    self._draw_debug_overlay(frame, frame_w, frame_h)
+            return self.last_cursor_position, landmarks
+
+        # Relative iris position in eye socket (0-1)
         relative_iris = self.face_detector.get_left_eye_relative_iris_position(landmarks)
-        used_fallback = False
-        if self._last_relative_iris is not None:
-            lx, ly = self._last_relative_iris
-            if abs(iris_x - lx) < self.config.get("gaze_dead_zone", 0.0015) and \
-                abs(iris_y - ly) < self.config.get("gaze_dead_zone", 0.0015):
-                iris_x, iris_y = lx, ly
-            self._last_relative_iris = (iris_x, iris_y)
         if relative_iris is None:
-            # Fallback: absolute iris -> screen so cursor still moves
-            iris_center_2d = self.face_detector.get_iris_center_2d(
-                landmarks, frame_w, frame_h, eye="left"
-            )
-            if iris_center_2d is None:
-                return None, landmarks
-            used_fallback = True
-            ix, iy = iris_center_2d
-            screen_x_direct = int(ix / frame_w * self.screen_w)
-            screen_y_direct = int(iy / frame_h * self.screen_h)
-        else:
-            # relative_iris = raw (iris_x, iris_y) from landmark 473
-            iris_x, iris_y = relative_iris
-
-            # ── Calibration session active: feed frame, don't move cursor ──
-            if self._calib_session is not None:
-                done, frame = self._calib_session.update(frame, (iris_x, iris_y))
-                if done:
-                    # Session finished — update gaze_calib centre too
-                    self.gaze_calib = self._calib_session.calib
-                    self._gaze_centre = (self.gaze_calib.cx, self.gaze_calib.cy)
-                    self._calib_session = None
-                    self.advanced_processor.prev_raw = None
-                    self.advanced_processor.prev_smooth = None
-                return None, landmarks
-
-            # ── If 9-point calibration exists, use it directly ─────────────
-            if self.gaze_calib.calibrated:
-                screen_x_direct, screen_y_direct = self.gaze_calib.map(iris_x, iris_y)
-
-            else:
-                # ── Fallback: warmup centre + linear gain ──────────────────
-                if self._gaze_centre is None:
-                    self._gaze_centre_samples.append((iris_x, iris_y))
-                    if len(self._gaze_centre_samples) >= self._GAZE_CENTRE_WARMUP:
-                        cx = sum(s[0] for s in self._gaze_centre_samples) / len(self._gaze_centre_samples)
-                        cy = sum(s[1] for s in self._gaze_centre_samples) / len(self._gaze_centre_samples)
-                        self._gaze_centre = (cx, cy)
-                        self.gaze_calib.cx = cx
-                        self.gaze_calib.cy = cy
-                        print(f"[CogniGaze] Gaze centre locked: iris_x={cx:.4f}  iris_y={cy:.4f}")
-                        print("[CogniGaze] Press C to run 9-point calibration for accurate mapping.")
-                    screen_x_direct = self.screen_w // 2
-                    screen_y_direct = self.screen_h // 2
-                else:
-                    screen_x_direct, screen_y_direct = self.gaze_calib.map(iris_x, iris_y)
-
-        # ── Apply Advanced Edge Compensation & Smoothing ─────────────
-        # Normalize into [0, 1] range for GazeProcessor
-        norm_x = screen_x_direct / self.screen_w
-        norm_y = screen_y_direct / self.screen_h
+            return None, landmarks
+            
+        eye_x, eye_y = relative_iris
         
+        # -- 3. Dynamic Range Tracking & Normalization (CRITICAL FULL FIX) --
+        # Expand bounds dynamically if raw eye coordinate pushes outside current known bounds
+        if not self._bounds_initialized:
+            self.eye_min_x, self.eye_max_x = eye_x - 0.05, eye_x + 0.05
+            self.eye_min_y, self.eye_max_y = eye_y - 0.05, eye_y + 0.05
+            self._bounds_initialized = True
+            
+        self.eye_min_x = min(self.eye_min_x, eye_x)
+        self.eye_max_x = max(self.eye_max_x, eye_x)
+        self.eye_min_y = min(self.eye_min_y, eye_y)
+        self.eye_max_y = max(self.eye_max_y, eye_y)
+        
+        # Prevent division by zero
+        range_x = max(0.001, self.eye_max_x - self.eye_min_x)
+        range_y = max(0.001, self.eye_max_y - self.eye_min_y)
+        
+        # Normalize into purely mapped [0, 1] range
+        norm_x = (eye_x - self.eye_min_x) / range_x
+        norm_y = (eye_y - self.eye_min_y) / range_y
+        
+        # --- Increase Sensitivity ---
+        # Amplify small gaze movements outward from the center (0.5)
+        sensitivity = self.config.get("gaze_sensitivity", 1.8)
+        norm_x = 0.5 + (norm_x - 0.5) * sensitivity
+        norm_y = 0.5 + (norm_y - 0.5) * sensitivity
+        
+        # Determine if we should freeze due to intent dwell (Keep logic separated)
+        # We process Dwell completely separate from mapping
+        
+        # ── Apply Lightweight EMA Smoothing ─────────────
         sm_norm_x, sm_norm_y = self.advanced_processor.map_and_smooth(norm_x, norm_y)
         
-        # Denormalize back to screen pixels
-        screen_x_direct = int(round(sm_norm_x * self.screen_w))
-        screen_y_direct = int(round(sm_norm_y * self.screen_h))
+        # Denormalize directly to final screen pixels
+        screen_x_direct = int(sm_norm_x * self.screen_w)
+        screen_y_direct = int(sm_norm_y * self.screen_h)
+
+        # -- Print/Debug output as requested --
+        if self._process_frame_count % 15 == 0:
+            print(f"RAW EYE: ({eye_x:.3f}, {eye_y:.3f}) | BOUNDS: X[{self.eye_min_x:.3f}-{self.eye_max_x:.3f}] Y[{self.eye_min_y:.3f}-{self.eye_max_y:.3f}] | NORM: ({norm_x:.3f}, {norm_y:.3f}) -> SCREEN: ({screen_x_direct}, {screen_y_direct})")
 
         screen_x_direct, screen_y_direct = clamp_screen_coordinates(
             screen_x_direct, screen_y_direct, self.screen_w, self.screen_h
@@ -341,21 +326,11 @@ class EyeGazeSystem:
             color = (0, 255, 0)
             status_text = "TRACKING"
 
-        # Show warmup countdown if gaze centre not yet locked
-        if self._gaze_centre is None and not self.gaze_calib.calibrated:
-            samples = len(self._gaze_centre_samples)
-            warmup_pct = int(samples / self._GAZE_CENTRE_WARMUP * 100)
-            warmup_text = f"CALIBRATING... {warmup_pct}%  Look straight at screen"
-            cv2.putText(frame, warmup_text, (10, frame_h - 90),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 255), 2)
-
         status_line = f"Status: {status_text} | Conf: {conf:.2f}"
         if fps > 0:
             status_line += f" | FPS: {fps:.1f}"
-        if self.gaze_calib.calibrated:
-            status_line += "  [C]=recalibrate  [R]=reset"
-        elif self._gaze_centre is not None:
-            status_line += "  [C]=9pt-calibrate  [R]=reset"
+            
+        status_line += "  [R] Reset Bounds"
         cv2.putText(frame, status_line, (10, frame_h - 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
         bar_w, bar_h = 200, 10
@@ -419,9 +394,8 @@ class EyeGazeSystem:
 
             pyautogui.FAILSAFE = False
             pyautogui.PAUSE = 0.0   # default is 0.1s — 100ms lag per moveTo call
-            calib_status = "9-pt calibration loaded [OK]" if self.gaze_calib.calibrated else "No calibration — press C to calibrate"
-            print(f"Eye Gaze System started. Press q=quit, d=debug, c=calibrate, r=reset centre.")
-            print(f"Screen: {self.screen_w}x{self.screen_h}  |  {calib_status}")
+            print(f"[CogniGaze] System started. Press q=quit, d=debug, c=calibrate limits, r=reset mapping.")
+            print(f"[CogniGaze] Screen bounds: {self.screen_w}x{self.screen_h}")
 
             frame_time = 1.0 / fps
             last_time = time.time()
@@ -448,6 +422,10 @@ class EyeGazeSystem:
 
                 if screen_coords:
                     self.cursor_controller.move_to(screen_coords[0], screen_coords[1])
+                    
+                    # Dwell-time click detection
+                    if self.dwell_detector.update(screen_coords[0], screen_coords[1]):
+                        pyautogui.click()
 
                 if landmarks:
                     should_click, click_type = self.blink_detector.should_trigger_click(landmarks, eye="left")
@@ -465,24 +443,10 @@ class EyeGazeSystem:
                 elif key == ord("d"):
                     self.debug_mode = not self.debug_mode
                     print("Debug overlay ON" if self.debug_mode else "Debug overlay OFF")
-                elif key == ord("c"):
-                    # Start 9-point gaze calibration
-                    print("[CogniGaze] Starting 9-point calibration. Look at each dot and press SPACE.")
-                    self._calib_session = CalibrationSession(
-                        self.gaze_calib, self.screen_w, self.screen_h
-                    )
-                    self.advanced_processor.prev_raw = None
-                    self.advanced_processor.prev_smooth = None
-                elif key == ord(" ") and self._calib_session is not None:
-                    self._calib_session.confirm_point()
                 elif key == ord("r"):
-                    # Reset gaze centre — look straight at screen and press r
-                    self._gaze_centre = None
-                    self._gaze_centre_samples = []
-                    self.advanced_processor.prev_raw = None
+                    self._bounds_initialized = False
                     self.advanced_processor.prev_smooth = None
-                    self._last_relative_iris = None
-                    print("[CogniGaze] Gaze centre RESET — hold still for 2 seconds to recalibrate.")
+                    print("[CogniGaze] Dynamic boundaries RESET to currently tracked eye position.")
 
             cv2.destroyAllWindows()
 
